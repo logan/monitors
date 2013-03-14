@@ -119,6 +119,7 @@ class Master:
         self.pipes = None
         self.controllers = None
         self.num_stats = None
+        self.stat_key_counter = None
 
     def _bind(self):
         assert self.sock is None, 'Master.start() should only be invoked once'
@@ -164,8 +165,11 @@ class Master:
         agg_timers = {}
         total_message_count = 0
         total_byte_count = 0
+        stat_key_counts = {}
         for counters, timers in results:
             for key, value in counters.iteritems():
+                if key.startswith('tallier._key_counts.'):
+                    stat_key_counts[key[len('tallier._key_counts.'):]] = value
                 agg_counters[key] += value
                 if key.startswith('tallier.messages.child_'):
                     total_message_count += value
@@ -173,6 +177,15 @@ class Master:
                     total_byte_count += value
             for key, values in timers.iteritems():
                 agg_timers.setdefault(key, []).extend(values)
+        self.stat_key_counter._sample_batch(stat_key_counts)
+        if time.time() - self._last_stat_msg >= 60:
+            top_stats = self.stat_key_counter.top(10)
+            if top_stats:
+                logging.info(
+                    'Top stat keys:\n%s\n(coverage=%s)',
+                    '\n'.join('  %s=%s' % i for i in top_stats),
+                    '%d/%d' % self.stat_key_counter.coverage)
+            self._last_stat_msg = time.time()
 
         agg_counters['tallier.messages.total'] = total_message_count
         agg_counters['tallier.bytes.total'] = total_byte_count
@@ -242,6 +255,8 @@ class Master:
         self.last_flush_time = time.time()
         self.next_flush_time = self.last_flush_time + self.flush_interval
         self.num_stats = 0
+        self.stat_key_counter = FrequencyCounter()
+        self._last_stat_msg = time.time()
         logging.info('Running.')
         try:
             while True:
@@ -374,6 +389,7 @@ class Listener(threading.Thread):
             self.current_samples[0][key] += value / sample.sample_rate
         else:
             self.current_samples[1].setdefault(key, []).append(value)
+        self.current_samples[0]['tallier._key_counts.%s' % key] += 1
 
     def flush(self):
         samples, self.current_samples = (
@@ -460,6 +476,48 @@ class Sample:
         else:
             value_type = cls.COUNTER
         return cls(key, value, value_type, sample_rate)
+
+
+class FrequencyCounter:
+    """Maintains approximate count of the most frequent items in a stream.
+
+    Because a very large variety of values may be seen, we store only a sample
+    biased toward the most frequently occurring items.
+    """
+
+    def __init__(self, size=1000):
+        self.size = size
+        self.oversample_size = size
+        self.total_observed = 0
+        self.frequencies = collections.defaultdict(int)
+
+    def sample(self, chunk):
+        batch = collections.defaultdict(int)
+        for key in chunk:
+            batch[key] += 1
+        self._sample_batch(batch)
+
+    def _sample_batch(self, batch):
+        for key, value in sorted(batch.items(), key=lambda i: -i[1]):
+            self.total_observed += value
+            self.frequencies[key] += value
+        if len(self.frequencies) > self.size + self.oversample_size:
+            overrun = len(self.frequencies) - self.size - self.oversample_size
+            self.cleanup(overrun)
+
+    def cleanup(self, num):
+        items = sorted(self.frequencies.items(), key=lambda i: i[1])
+        for key, _ in items[:num]:
+            del self.frequencies[key]
+        logging.info('reduced frequencies size by %s to %s', num,
+                     len(self.frequencies))
+
+    def top(self, n):
+        return sorted(self.frequencies.items(), key=lambda i: -i[1])[:n]
+
+    @property
+    def coverage(self):
+        return sum(self.frequencies.itervalues()), self.total_observed
 
 if __name__ == '__main__':
     alerts.init()

@@ -92,6 +92,8 @@ class MasterTest(unittest.TestCase):
         master._build_graphite_report = lambda x, y: (
             x, dict((k, list(sorted(v))) for k, v in y.iteritems()))
         master._send_to_graphite = lambda x: x
+        master.stat_key_counter = tallier.FrequencyCounter()
+        master._last_stat_msg = 0
 
         agg_counters, agg_timers = master._flush()
         self.assertEquals(
@@ -134,7 +136,7 @@ class ListenerTest(unittest.TestCase):
         dgram = 'key:1|c:2|c:3|c:4|ms:5|ms:6|ms'
         listener._handle_datagram(dgram)
         expected_data = (
-            {'key': 6},
+            {'key': 6, 'tallier._key_counts.key': 6},
             {'key': [4, 5, 6]})
         self.assertEquals(expected_data, listener.current_samples)
         expected_data[0]['tallier.messages.child_0'] = 1
@@ -208,6 +210,50 @@ class SampleTest(unittest.TestCase):
         self.assertEquals(2, ss[2].value)
         self.assertEquals('abdef', ss[3].key)
         self.assertEquals(3, ss[3].value)
+
+
+class FrequencyCounterTest(unittest.TestCase):
+    def test_sample_batch(self):
+        fc = tallier.FrequencyCounter(size=3)
+        self.assertEquals({}, fc.frequencies)
+        fc._sample_batch({'a': 2, 'b': 1, 'c': 3, 'd': 4})
+        self.assertEquals(
+            {'a': 2, 'b': 1, 'c': 3, 'd': 4},
+            fc.frequencies)
+        fc._sample_batch({'a': 10, 'e': 5, 'f': 5})
+        self.assertEquals(
+            {'a': 12, 'b': 1, 'c': 3, 'd': 4, 'e': 5, 'f': 5},
+            fc.frequencies)
+        fc._sample_batch({'b': 1, 'g': 2})
+        self.assertEquals(
+            {'a': 12, 'c': 3, 'd': 4, 'e': 5, 'f': 5, 'g': 2},
+            fc.frequencies)
+
+    def test_cleanup(self):
+        fc = tallier.FrequencyCounter()
+        expected = {'a': 1, 'b': 2, 'c': 3, 'd': 4, 'e': 5}
+        fc.frequencies = expected.copy()
+        fc.cleanup(0)
+        self.assertEquals(expected, fc.frequencies)
+        fc.cleanup(2)
+        del expected['a']
+        del expected['b']
+        self.assertEquals(expected, fc.frequencies)
+
+    def test_top(self):
+        fc = tallier.FrequencyCounter()
+        fc.sample('a' * 3 + 'b' * 2 + 'c' * 4 + 'd' * 1)
+        self.assertEquals([('c', 4), ('a', 3)], fc.top(2))
+
+    def test_coverage(self):
+        fc = tallier.FrequencyCounter(size=2)
+        fc.sample('a' * 20)
+        self.assertEquals((20, 20), fc.coverage)
+        fc.sample('b' * 10 + 'c' * 2 + 'd' * 1)
+        self.assertEquals((33, 33), fc.coverage)
+        fc.sample('c' * 2 + 'd' * 4 + 'e' * 10 + 'b' * 3)
+        self.assertEquals((48, 52), fc.coverage)
+
 
 if __name__ == '__main__':
     unittest.main()
