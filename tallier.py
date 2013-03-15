@@ -130,7 +130,8 @@ class Master:
         self.pipes = None
         self.controllers = None
         self.num_stats = None
-        self.stat_key_counter = None
+        self.frequency_counters = None
+        self.command_service = None
 
     def _bind(self):
         assert self.sock is None, (
@@ -185,11 +186,8 @@ class Master:
         agg_timers = {}
         total_message_count = 0
         total_byte_count = 0
-        stat_key_counts = {}
-        for counters, timers in results:
+        for counters, timers, frequency_counts in results:
             for key, value in counters.iteritems():
-                if key.startswith('tallier._key_counts.'):
-                    stat_key_counts[key[len('tallier._key_counts.'):]] = value
                 agg_counters[key] += value
                 if key.startswith('tallier.messages.child_'):
                     total_message_count += value
@@ -197,15 +195,8 @@ class Master:
                     total_byte_count += value
             for key, values in timers.iteritems():
                 agg_timers.setdefault(key, []).extend(values)
-        self.stat_key_counter._sample_batch(stat_key_counts)
-        if time.time() - self._last_stat_msg >= 60:
-            top_stats = self.stat_key_counter.top(10)
-            if top_stats:
-                logging.info(
-                    'Top stat keys:\n%s\n(coverage=%s)',
-                    '\n'.join('  %s=%s' % i for i in top_stats),
-                    '%d/%d' % self.stat_key_counter.coverage)
-            self._last_stat_msg = time.time()
+            for key, fc in frequency_counts:
+                self.frequency_counters[key].merge(fc)
 
         agg_counters['tallier.messages.total'] = total_message_count
         agg_counters['tallier.bytes.total'] = total_byte_count
@@ -275,8 +266,7 @@ class Master:
         self.last_flush_time = time.time()
         self.next_flush_time = self.last_flush_time + self.flush_interval
         self.num_stats = 0
-        self.stat_key_counter = FrequencyCounter()
-        self._last_stat_msg = time.time()
+        self.frequency_counters = collections.defaultdict(FrequencyCounter)
         logging.info('Running.')
         try:
             while True:
@@ -312,6 +302,39 @@ class Master:
         for key, _ in sorted(inspect.getmembers(self, inspect.ismethod)):
             if key.startswith('CMD_'):
                 yield '  %s' % key[4:].upper()
+
+    def CMD_topstats(self, parts):
+        n = 25
+        if len(parts) > 1:
+            try:
+                n = int(parts[1])
+            except ValueError:
+                yield 'ERROR: usage: topstats [N]'
+                return
+        for line in self.CMD_freqcount(['', 'tallier.key_counts'], n=n):
+            yield line
+
+    def CMD_freqcount(self, parts, n=10):
+        if len(parts) < 2:
+            keys = self.frequency_counters.keys()
+        else:
+            keys = parts[1:]
+
+        for key in keys:
+            if key in self.frequency_counters:
+                fc = self.frequency_counters[key]
+                covered, total = fc.coverage
+                if not total:
+                    yield 'no strings recorded for %s ??' % key
+                    continue
+                yield ''
+                yield 'Top %d %s (coverage=%d%%):' % (
+                    min(len(fc.frequencies), n), key, 100.0 * covered / total)
+                for i, (value, count) in enumerate(fc.top(n)):
+                    yield '  %d. %r (%d, %d%%)' % (
+                        i + 1, value, count, 100.0 * count / total)
+            else:
+                yield 'no strings recorded for %s' % key
 
 
 class Controller:
@@ -399,6 +422,7 @@ class Listener(threading.Thread):
         self.last_message_count = None
         self.byte_count = None
         self.last_byte_count = None
+        self.frequency_counters = None
 
     def start(self):
         """Creates the Listener thread, starts up the Listener, and returns."""
@@ -410,6 +434,7 @@ class Listener(threading.Thread):
         self.last_message_count = 0
         self.byte_count = 0
         self.last_byte_count = 0
+        self.frequency_counters = collections.defaultdict(FrequencyCounter)
         super(Listener, self).start()
 
     def run(self):
@@ -430,9 +455,11 @@ class Listener(threading.Thread):
         value = sample.value
         if sample.value_type is Sample.COUNTER:
             self.current_samples[0][key] += value / sample.sample_rate
-        else:
+        elif sample.value_type is Sample.TIMER:
             self.current_samples[1].setdefault(key, []).append(value)
-        self.current_samples[0]['tallier._key_counts.%s' % key] += 1
+        elif sample.value_type is Sample.STRING:
+            self.frequency_counters[key]._sample_batch({sample.string: value})
+        self.frequency_counters['tallier.key_counts'].sample([key])
 
     def flush(self):
         samples, self.current_samples = (
@@ -450,27 +477,39 @@ class Listener(threading.Thread):
             bc - self.last_byte_count)
         self.last_byte_count = bc
 
-        return samples
+        return samples + ([(key, fc.frequencies)
+                           for key, fc in self.frequency_counters.iteritems()],)
 
 class Sample:
     """A key, value, value type, and sample rate."""
 
     COUNTER = 'counter'
     TIMER = 'timer'
+    STRING = 'string'
+
+    type_codes = {
+        COUNTER: 'c',
+        TIMER: 'ms',
+        STRING: 's',
+    }
 
     _VALID_CHAR_PATTERN = re.compile(r'[A-Za-z0-9._-]')
 
-    def __init__(self, key, value, value_type, sample_rate):
+    def __init__(self, key, value, value_type, sample_rate, string=None):
         self.key = key
         self.value = value
         self.value_type = value_type
         self.sample_rate = sample_rate
+        self.string = string
 
     def __str__(self):
-        return '%s:%f@%s|%f' % (
-            self.key, self.value,
-            'ms' if self.value_type is self.TIMER else 'c',
-            self.sample_rate)
+        if self.string is not None:
+            encoded_string = self._encode_string(self.string)
+        else:
+            encoded_string = ''
+        return '%s:%f|%s@%s%s' % (
+            self.key, self.value, self.type_codes[self.value_type],
+            self.sample_rate, encoded_string)
 
     @classmethod
     def parse(cls, datagram):
@@ -500,13 +539,30 @@ class Sample:
         key = '_'.join(key.split()).replace('\\', '-')
         return ''.join(cls._VALID_CHAR_PATTERN.findall(key))
 
+    @staticmethod
+    def _decode_string(string):
+        return (
+            string.replace('\\n', '\n')
+                .replace('\\&', '|')
+                .replace('\\\\', '\\'))
+
+    @staticmethod
+    def _encode_string(string):
+        # escape \ -> \\, | -> \&, and newline -> \n
+        return (
+            string.replace('\\', '\\\\')
+                .replace('\n', '\\n')
+                .replace('|', '\\&'))
+
     @classmethod
     def _parse_part(cls, key, part):
-        # format: <value> '|' <value_type> ('@' <sample_rate>)?
+        # format:
+        #   <value> '|' <value_type> ('@' <sample_rate>)? ('|' <encstring>)
         fields = part.split('|')
-        if len(fields) != 2:
+        if not (2 <= len(fields) <= 3):
             raise ValueError
         value = float(fields[0])
+        string = None
         if '@' in fields[1]:
             fields[1], sample_rate = fields[1].split('@', 1)
             sample_rate = float(sample_rate)
@@ -516,9 +572,14 @@ class Sample:
             sample_rate = 1.0
         if fields[1] == 'ms':
             value_type = cls.TIMER
+        elif fields[1] == 's':
+            value_type = cls.STRING
+            if len(fields) != 3:
+                raise ValueError
+            string = cls._decode_string(fields[2])
         else:
             value_type = cls.COUNTER
-        return cls(key, value, value_type, sample_rate)
+        return cls(key, value, value_type, sample_rate, string)
 
 
 class FrequencyCounter:
@@ -548,12 +609,15 @@ class FrequencyCounter:
             overrun = len(self.frequencies) - self.size - self.oversample_size
             self.cleanup(overrun)
 
+    def merge(self, frequency_counts):
+        for key, value in frequency_counts.iteritems():
+            self.frequencies[key] += value
+            self.total_observed += value
+
     def cleanup(self, num):
         items = sorted(self.frequencies.items(), key=lambda i: i[1])
         for key, _ in items[:num]:
             del self.frequencies[key]
-        logging.info('reduced frequencies size by %s to %s', num,
-                     len(self.frequencies))
 
     def top(self, n):
         return sorted(self.frequencies.items(), key=lambda i: -i[1])[:n]
@@ -592,6 +656,9 @@ class CommandChannel(asynchat.async_chat):
         self.data += data
 
     def found_terminator(self):
+        if self.data.lower() == 'quit' or self.data.lower().startswith('quit '):
+            self.close()
+            return
         for data in self.on_command(self.data):
             self.push(data)
         self.data = ''

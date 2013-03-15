@@ -83,17 +83,18 @@ class MasterTest(unittest.TestCase):
 
     def test_flush(self):
         child_reports = [
-            ({'a': 1}, {'t1': [1, 2, 3]}),
-            ({'b': 2}, {'t2': [2, 3, 4]}),
-            ({'a': 3, 'b': 4}, {'t1': [5, 6], 't2': [6, 7]}),
+            ({'a': 1}, {'t1': [1, 2, 3]}, [('k', {'x': 1, 'y': 2})]),
+            ({'b': 2}, {'t2': [2, 3, 4]}, []),
+            ({'a': 3, 'b': 4}, {'t1': [5, 6], 't2': [6, 7]},
+             [('k', {'x': 3}), ('l', {'x': 5})]),
         ]
         master = tallier.Master('', 0, 1)
+        master.frequency_counters = (
+            collections.defaultdict(tallier.FrequencyCounter))
         master._command_all = lambda cmd: child_reports
         master._build_graphite_report = lambda x, y: (
             x, dict((k, list(sorted(v))) for k, v in y.iteritems()))
         master._send_to_graphite = lambda x: x
-        master.stat_key_counter = tallier.FrequencyCounter()
-        master._last_stat_msg = 0
 
         agg_counters, agg_timers = master._flush()
         self.assertEquals(
@@ -104,11 +105,17 @@ class MasterTest(unittest.TestCase):
              agg_counters)
         self.assertEquals(
             {'t1': [1, 2, 3, 5, 6], 't2': [2, 3, 4, 6, 7]}, agg_timers)
+        self.assertEquals(
+            {'k': {'x': 4, 'y': 2}, 'l': {'x': 5}},
+            {k: v.frequencies for k, v in master.frequency_counters.items()})
+
 
 class ListenerTest(unittest.TestCase):
     def test_handle_sample(self):
         listener = tallier.Listener(0, None)
         listener.current_samples = (collections.defaultdict(float), {})
+        listener.frequency_counters = (
+            collections.defaultdict(tallier.FrequencyCounter))
 
         s = tallier.Sample(
             key='key', value=1.0, value_type=tallier.Sample.COUNTER,
@@ -133,14 +140,17 @@ class ListenerTest(unittest.TestCase):
         listener.byte_count = 0
         listener.last_byte_count = 0
         listener.current_samples = (collections.defaultdict(float), {})
+        listener.frequency_counters = collections.defaultdict(
+            tallier.FrequencyCounter)
         dgram = 'key:1|c:2|c:3|c:4|ms:5|ms:6|ms'
         listener._handle_datagram(dgram)
         expected_data = (
-            {'key': 6, 'tallier._key_counts.key': 6},
+            {'key': 6},
             {'key': [4, 5, 6]})
         self.assertEquals(expected_data, listener.current_samples)
         expected_data[0]['tallier.messages.child_0'] = 1
         expected_data[0]['tallier.bytes.child_0'] = len(dgram)
+        expected_data += ([('tallier.key_counts', {'key': 6})],)
         self.assertEquals(expected_data, listener.flush())
         self.assertEquals(({}, {}), listener.current_samples)
 
@@ -151,6 +161,11 @@ class SampleTest(unittest.TestCase):
         self.assertEquals('test_1', n('test_1'))
         self.assertEquals('test_1-2', n('test 1\\2'))
         self.assertEquals('test1-2', n('[()@test#@&$^@&#*^1-2'))
+
+    def test_decode_string(self):
+        d = tallier.Sample._decode_string
+        self.assertEquals('test', d('test'))
+        self.assertEquals('\n|&\\', d('\\n\\&&\\\\'))
 
     def test_parse_part(self):
         p = tallier.Sample._parse_part
@@ -174,6 +189,13 @@ class SampleTest(unittest.TestCase):
         self.assertEquals(123.45, s.value)
         self.assertEquals(tallier.Sample.TIMER, s.value_type)
         self.assertEquals(1.0, s.sample_rate)
+
+        s = p(k, '123|s|test\\\\string\&\\n')
+        self.assertEquals(k, s.key)
+        self.assertEquals(123.0, s.value)
+        self.assertEquals(tallier.Sample.STRING, s.value_type)
+        self.assertEquals(1.0, s.sample_rate)
+        self.assertEquals('test\\string|\n', s.string)
 
     def test_parse(self):
         self.assertEquals([], tallier.Sample.parse('a:b:c'))
