@@ -45,7 +45,10 @@ flush_interval = 10
 
 from __future__ import division
 
+import asynchat
+import asyncore
 import collections
+import inspect
 import logging
 import multiprocessing
 import os
@@ -80,22 +83,29 @@ class Master:
         else:
             iface = ''
         port = config.getint('tallier', 'port')
+        if config.has_option('tallier', 'command_port'):
+            command_port = config.getint('tallier', 'command_port')
+        else:
+            command_port = None
         num_workers = config.getint('tallier', 'num_workers')
         graphite_addr = config.get('graphite', 'graphite_addr')
         if (config.has_option('tallier', 'enable_heartbeat')
             and not config.getboolean('tallier', 'enable_heartbeat')):
             harold = None
-        return cls(iface, port, num_workers, flush_interval=flush_interval,
-                   graphite_addr=graphite_addr, harold=harold)
+        return cls(iface, port, num_workers, command_port=command_port,
+                   flush_interval=flush_interval, graphite_addr=graphite_addr,
+                   harold=harold)
 
-    def __init__(self, iface, port, num_workers, flush_interval=10,
-                 graphite_addr='localhost:2003', harold=None):
+    def __init__(self, iface, port, num_workers, command_port=None,
+                 flush_interval=10, graphite_addr='localhost:2003',
+                 harold=None):
         """Constructor.
 
         Args:
           - iface: str, address to bind to when the service starts (or '' for
                 INADDR_ANY).
-          - port: int, port to bind to.
+          - port: int, udp port to listen for stat datagrams.
+          - command_port: int, (optional) tcp port to listen for commands.
           - num_workers: int, size of datagram receiving pool (processes); must
                 be >= 1.
           - flush_interval: float, time (in seconds) between each flush
@@ -106,6 +116,7 @@ class Master:
         assert num_workers >= 1
         self.iface = iface
         self.port = port
+        self.command_port = command_port
         self.num_workers = num_workers
         self.flush_interval = flush_interval
         self.graphite_host, self.graphite_port = graphite_addr.split(':')
@@ -122,9 +133,15 @@ class Master:
         self.stat_key_counter = None
 
     def _bind(self):
-        assert self.sock is None, 'Master.start() should only be invoked once'
+        assert self.sock is None, (
+            'Master.start() should only be invoked once')
+        assert self.command_service is None, (
+            'Master.start() should only be invoked once')
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((self.iface, self.port))
+        if self.command_port:
+            self.command_service = CommandService(self.iface, self.command_port,
+                                                  self.run_command)
 
     def _create_controllers(self):
         assert self.controllers is None, (
@@ -145,6 +162,9 @@ class Master:
         logging.info('Closing socket...')
         self.sock.close()
         self.sock = None
+        if self.command_service:
+            self.command_service.close()
+            self.command_service = None
         logging.info('Sending shutdown command...')
         results = self._command_all(SHUTDOWN)
         logging.info('Messages: %r (total = %d)', results, sum(results))
@@ -260,16 +280,39 @@ class Master:
         logging.info('Running.')
         try:
             while True:
-                # sleep until next flush time
                 sleep_time = self.next_flush_time - time.time()
+                # sleep until I/O or next flush time
                 if sleep_time > 0:
-                    time.sleep(sleep_time)
-                self._flush()
-                self.next_flush_time += self.flush_interval
+                    asyncore.poll(sleep_time)
+                else:
+                    self._flush()
+                    self.next_flush_time += self.flush_interval
         except KeyboardInterrupt:
             pass
         finally:
             self._shutdown()
+
+    def run_command(self, line):
+        parts = line.lower().split()
+        if not parts:
+            yield 'ERROR: invalid command\r\n'
+            return
+        handler = getattr(self, 'CMD_%s' % parts[0], None)
+        if handler:
+            for line in handler(parts):
+                if line.startswith('.'):
+                    line = '.' + line
+                yield line + '\r\n'
+            yield '.\r\n'
+        else:
+            yield 'ERROR: invalid command\r\n'
+
+    def CMD_help(self, parts):
+        yield 'Available commands:'
+        for key, _ in sorted(inspect.getmembers(self, inspect.ismethod)):
+            if key.startswith('CMD_'):
+                yield '  %s' % key[4:].upper()
+
 
 class Controller:
     """The main thread of each server process.
@@ -518,6 +561,41 @@ class FrequencyCounter:
     @property
     def coverage(self):
         return sum(self.frequencies.itervalues()), self.total_observed
+
+
+class CommandService(asyncore.dispatcher):
+    """Provides a command line interface to inspect tallier via tcp."""
+
+    def __init__(self, iface, port, on_command):
+        asyncore.dispatcher.__init__(self)
+        self.on_command = on_command
+        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.set_reuse_addr()
+        self.bind((iface, port))
+        self.listen(5)
+
+    def handle_accept(self):
+        conn, addr = self.accept()
+        CommandChannel(conn, addr, self.on_command)
+
+
+class CommandChannel(asynchat.async_chat):
+    """Provides a command line interface over a given tcp socket."""
+
+    def __init__(self, sock, addr, on_command):
+        asynchat.async_chat.__init__(self, sock)
+        self.on_command = on_command
+        self.set_terminator('\r\n')
+        self.data = ''
+
+    def collect_incoming_data(self, data):
+        self.data += data
+
+    def found_terminator(self):
+        for data in self.on_command(self.data):
+            self.push(data)
+        self.data = ''
+
 
 if __name__ == '__main__':
     alerts.init()
