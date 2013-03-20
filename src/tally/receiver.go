@@ -8,30 +8,20 @@ import (
 
 const STATGRAM_CHANNEL_BUFSIZE = 1024
 
+// Receivers share the work of listening on a UDP port and accumulating stats.
 type Receiver struct {
-    id string
+    id string // child identifier for collecting internal stats
     conn *net.UDPConn
-    snapshot *Snapshot
-    statgrams chan Statgram
-    flush chan *Snapshot
-    quit chan int
+    snapshot *Snapshot // current snapshot we're collecting into
     lastMessageCount int64
     messageCount int64
     lastByteCount int64
     byteCount int64
 }
 
-func NewReceiver(id string, conn *net.UDPConn) *Receiver {
-    return &Receiver{
-        id: id,
-        conn: conn,
-        snapshot: NewSnapshot(),
-        statgrams: make(chan Statgram, STATGRAM_CHANNEL_BUFSIZE),
-        flush: make(chan *Snapshot),
-        quit: make(chan int),
-    }
-}
-
+// ReadOnce blocks on the listening connection until a statgram arrives. It
+// takes care of parsing it and returns it. Any parse errors are ignored, so
+// it's possible an empty statgram will be returned.
 func (receiver *Receiver) ReadOnce() (statgram Statgram, err error) {
     buf := make([]byte, 1024)
     var size int
@@ -44,61 +34,73 @@ func (receiver *Receiver) ReadOnce() (statgram Statgram, err error) {
     return
 }
 
-func (receiver *Receiver) ReceiveStatgrams() {
-    for {
-        statgram, err := receiver.ReadOnce()
-        if err != nil { break }
-        receiver.statgrams <- statgram
-    }
-}
-
-func (receiver *Receiver) Process(statgram Statgram) {
-    for _, sample := range(statgram) {
-        switch (sample.valueType) {
-            case COUNTER:
-                receiver.snapshot.Count(sample.key, sample.value / sample.sampleRate)
-            case TIMER:
-                receiver.snapshot.Time(sample.key, sample.value)
+// ReceiveStatgrams spins off a goroutine to read statgrams off the UDP port.
+// Returns a buffered channel that will receive statgrams as they arrive.
+func (receiver *Receiver) ReceiveStatgrams() (statgrams chan Statgram) {
+    statgrams = make(chan Statgram, STATGRAM_CHANNEL_BUFSIZE)
+    go func() {
+        for {
+            statgram, err := receiver.ReadOnce()
+            if err != nil { break }
+            statgrams <- statgram
         }
-    }
-}
-
-func (receiver *Receiver) Flush() (snapshot *Snapshot) {
-    snapshot = receiver.snapshot
-    snapshot.Count("tallier.messages.child_" + receiver.id,
-            float64(receiver.messageCount - receiver.lastMessageCount))
-    snapshot.Count("tallier.bytes.child_" + receiver.id,
-            float64(receiver.byteCount - receiver.lastByteCount))
-    receiver.lastMessageCount = receiver.messageCount
-    receiver.lastByteCount = receiver.byteCount
-    receiver.snapshot = NewSnapshot()
-    log.Printf("receiver returning snapshot")
+    }()
     return
 }
 
-func (receiver *Receiver) Loop() {
-    go receiver.ReceiveStatgrams()
-    for {
-        select {
-            case statgram := <-receiver.statgrams:
-                receiver.Process(statgram)
-            case _ = <-receiver.quit:
-                break
-            case _ = <-receiver.flush:
-                receiver.flush <- receiver.Flush()
+// ProcessStatgram accumulates a statistic report into the current snapshot.
+func (receiver *Receiver) ProcessStatgram(statgram Statgram) {
+    for _, sample := range(statgram) {
+        switch (sample.valueType) {
+        case COUNTER:
+            receiver.snapshot.Count(sample.key, sample.value / sample.sampleRate)
+        case TIMER:
+            receiver.snapshot.Time(sample.key, sample.value)
         }
     }
 }
 
-// Spin off receivers and a goroutine to manage them. Returns a channel by
-// which aggregated snapshots will be shared at the given interval.
+// RunReceiver spins off a goroutine to receive and process statgrams. Returns a
+// bidirectional control channel, which provides a snapshot each time it's given
+// a nil value.
+func RunReceiver(id string, conn *net.UDPConn) (controlChannel chan *Snapshot) {
+    receiver := &Receiver{
+        id: id,
+        conn: conn,
+        snapshot: NewSnapshot(),
+    }
+    controlChannel = make(chan *Snapshot)
+    statgrams := receiver.ReceiveStatgrams()
+    go func() {
+        for {
+            select {
+            case statgram := <-statgrams:
+                receiver.ProcessStatgram(statgram)
+            case _ = <-controlChannel:
+                snapshot := receiver.snapshot
+                snapshot.Count("tallier.messages.child_" + receiver.id,
+                        float64(receiver.messageCount - receiver.lastMessageCount))
+                snapshot.Count("tallier.bytes.child_" + receiver.id,
+                        float64(receiver.byteCount - receiver.lastByteCount))
+                receiver.lastMessageCount = receiver.messageCount
+                receiver.lastByteCount = receiver.byteCount
+                receiver.snapshot = NewSnapshot()
+                controlChannel <- snapshot
+            }
+        }
+    }()
+    return
+}
+
+// Aggregate spins off receivers and a goroutine to manage them. Returns a
+// channel by which aggregated snapshots will be shared at the given interval.
 func Aggregate(conn *net.UDPConn, numReceivers int, flushInterval time.Duration) (snapchan chan *Snapshot) {
     snapchan = make(chan *Snapshot)
-    receivers := make([]*Receiver, numReceivers)
-    for i := range(receivers) {
-        receivers[i] = NewReceiver(string(i), conn)
-        go receivers[i].Loop()
+    var controlChannels []chan *Snapshot
+    for i := 0; i < numReceivers; i++ {
+        controlChannels = append(controlChannels, RunReceiver(string(i), conn))
     }
+
     go func() {
         var numStats int64 = 0
         var snapshot *Snapshot
@@ -109,13 +111,13 @@ func Aggregate(conn *net.UDPConn, numReceivers int, flushInterval time.Duration)
             log.Printf("aggregator sleeping for %s", flushInterval)
             time.Sleep(flushInterval)
             log.Printf("aggregator sending flush command to receivers")
-            for _, receiver := range(receivers) {
-                receiver.flush <- nil
+            for _, controlChannel := range(controlChannels) {
+                controlChannel <- nil
             }
             log.Printf("aggregator collecting flush responses")
             snapshot.duration = time.Now().Sub(snapshot.start)
-            for _, receiver := range(receivers) {
-                snapshot.Aggregate(<-receiver.flush)
+            for _, controlChannel := range(controlChannels) {
+                snapshot.Aggregate(<-controlChannel)
             }
             numStats += int64(snapshot.NumStats())
             snapshot.totalStats = numStats
