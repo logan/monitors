@@ -5,6 +5,7 @@ import (
     "strings"
 )
 
+// Graphite is a client for sending stat reports to a graphite (carbon) server.
 type Graphite struct {
     addr *net.TCPAddr
 }
@@ -18,6 +19,7 @@ func GraphiteFromConfig(config Config) (client *Graphite, err error) {
     return
 }
 
+// SendReport takes a snapshot and submits all its stats to graphite.
 func (client *Graphite) SendReport(snapshot *Snapshot) (err error) {
     var conn *net.TCPConn
     conn, err = net.DialTCP("tcp", nil, client.addr)

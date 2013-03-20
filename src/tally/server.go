@@ -46,11 +46,11 @@ func (server *Server) Setup() error {
 }
 
 func (server *Server) Loop() {
-    intervals := make(chan time.Duration)
+    var intervals chan time.Duration
     log.Printf("setting up server")
     server.Setup()
     if server.harold != nil {
-        go server.harold.HeartMonitor("tallier", intervals)
+        intervals = server.harold.HeartMonitor("tallier")
     }
     snapchan := Aggregate(server.conn, server.numWorkers, server.flushInterval)
     log.Printf("running")
