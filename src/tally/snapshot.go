@@ -43,6 +43,18 @@ func (snapshot *Snapshot) Time(key string, value float64) {
     snapshot.timings[key] = append(timings, value)
 }
 
+// ProcessStatgram accumulates a statistic report into the current snapshot.
+func (snapshot *Snapshot) ProcessStatgram(statgram Statgram) {
+    for _, sample := range(statgram) {
+        switch (sample.valueType) {
+        case COUNTER:
+            snapshot.Count(sample.key, sample.value / sample.sampleRate)
+        case TIMER:
+            snapshot.Time(sample.key, sample.value)
+        }
+    }
+}
+
 func (snapshot *Snapshot) Aggregate(child *Snapshot) {
     for key, value := range(child.counts) {
         snapshot.Count(key, value)

@@ -48,18 +48,6 @@ func (receiver *Receiver) ReceiveStatgrams() (statgrams chan Statgram) {
     return
 }
 
-// ProcessStatgram accumulates a statistic report into the current snapshot.
-func (receiver *Receiver) ProcessStatgram(statgram Statgram) {
-    for _, sample := range(statgram) {
-        switch (sample.valueType) {
-        case COUNTER:
-            receiver.snapshot.Count(sample.key, sample.value / sample.sampleRate)
-        case TIMER:
-            receiver.snapshot.Time(sample.key, sample.value)
-        }
-    }
-}
-
 // RunReceiver spins off a goroutine to receive and process statgrams. Returns a
 // bidirectional control channel, which provides a snapshot each time it's given
 // a nil value.
@@ -75,7 +63,7 @@ func RunReceiver(id string, conn *net.UDPConn) (controlChannel chan *Snapshot) {
         for {
             select {
             case statgram := <-statgrams:
-                receiver.ProcessStatgram(statgram)
+                receiver.snapshot.ProcessStatgram(statgram)
             case _ = <-controlChannel:
                 snapshot := receiver.snapshot
                 snapshot.Count("tallier.messages.child_" + receiver.id,
