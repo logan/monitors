@@ -14,8 +14,6 @@ type Server struct {
     flushInterval time.Duration
 
     conn *net.UDPConn
-    receivers []*Receiver
-    aggregator *Aggregator
     harold *Harold
     graphite *Graphite
 }
@@ -44,12 +42,6 @@ func (server *Server) Setup() error {
                                server.receiverPort))
     if err != nil { return err }
     server.conn, err = net.ListenUDP("udp", receiver_addr)
-    if err != nil { return err }
-    server.receivers = make([]*Receiver, server.numWorkers)
-    for i := range(server.receivers) {
-        server.receivers[i] = NewReceiver(fmt.Sprintf("%d", i), server.conn)
-    }
-    server.aggregator = NewAggregator(server.receivers, server.flushInterval)
     return err
 }
 
@@ -57,17 +49,14 @@ func (server *Server) Loop() {
     intervals := make(chan time.Duration)
     log.Printf("setting up server")
     server.Setup()
-    for _, receiver := range(server.receivers) {
-        go receiver.Loop()
-    }
-    go server.aggregator.Loop()
     if server.harold != nil {
         go server.harold.HeartMonitor("tallier", intervals)
     }
+    snapchan := Aggregate(server.conn, server.numWorkers, server.flushInterval)
     log.Printf("running")
     for {
         log.Printf("waiting for snapshot")
-        snapshot := <-server.aggregator.flush
+        snapshot := <-snapchan
         for {
             log.Printf("sending snapshot with %d stats to graphite",
                     snapshot.NumStats())

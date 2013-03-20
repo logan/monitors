@@ -2,43 +2,41 @@ package tally
 
 import (
     "log"
+    "net"
     "time"
 )
 
-type Aggregator struct {
-    receivers []*Receiver
-    flushDelay time.Duration
-    snapshot *Snapshot
-    flush chan *Snapshot
-}
-
-func NewAggregator(receivers []*Receiver, flushDelay time.Duration) *Aggregator {
-    return &Aggregator{
-        receivers: receivers,
-        flushDelay: flushDelay,
-        flush: make(chan *Snapshot),
+// Spin off receivers and a goroutine to manage them. Returns a channel by
+// which aggregated snapshots will be shared at the given interval.
+func Aggregate(conn *net.UDPConn, numReceivers int, flushInterval time.Duration) (snapchan chan *Snapshot) {
+    snapchan = make(chan *Snapshot)
+    receivers := make([]*Receiver, numReceivers)
+    for i := range(receivers) {
+        receivers[i] = NewReceiver(string(i), conn)
+        go receivers[i].Loop()
     }
-}
-
-func (aggregator *Aggregator) Loop() {
-    var numStats int64
-    for {
-        aggregator.snapshot = NewSnapshot()
-        aggregator.snapshot.start = time.Now()
-        log.Printf("aggregator sleeping for %s", aggregator.flushDelay)
-        time.Sleep(aggregator.flushDelay)
-        log.Printf("aggregator sending flush command to receivers")
-        for _, receiver := range(aggregator.receivers) {
-            receiver.flush <- nil
+    go func() {
+        var numStats int64 = 0
+        var snapshot *Snapshot
+        for {
+            if snapshot != nil { snapchan <- snapshot }
+            snapshot = NewSnapshot()
+            snapshot.start = time.Now()
+            log.Printf("aggregator sleeping for %s", flushInterval)
+            time.Sleep(flushInterval)
+            log.Printf("aggregator sending flush command to receivers")
+            for _, receiver := range(receivers) {
+                receiver.flush <- nil
+            }
+            log.Printf("aggregator collecting flush responses")
+            snapshot.duration = time.Now().Sub(snapshot.start)
+            for _, receiver := range(receivers) {
+                snapshot.Aggregate(<-receiver.flush)
+            }
+            numStats += int64(snapshot.NumStats())
+            snapshot.totalStats = numStats
+            log.Printf("aggregator returning snapshot")
         }
-        log.Printf("aggregator collecting flush responses")
-        aggregator.snapshot.duration = time.Now().Sub(aggregator.snapshot.start)
-        for _, receiver := range(aggregator.receivers) {
-            aggregator.snapshot.Aggregate(<-receiver.flush)
-        }
-        numStats += int64(aggregator.snapshot.NumStats())
-        aggregator.snapshot.totalStats = numStats
-        log.Printf("aggregator returning snapshot")
-        aggregator.flush <- aggregator.snapshot
-    }
+    }()
+    return
 }
