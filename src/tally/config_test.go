@@ -8,28 +8,28 @@ func AssertSyntaxError(t *testing.T, err error) {
     }
 }
 
-func (config *Config) AssertEmpty(t *testing.T) {
-	if len(config.sections) != 0 {
+func (config Config) AssertEmpty(t *testing.T) {
+	if len(config) != 0 {
 		t.Error("expected config to remain empty")
 	}
 }
 
-func (config *Config) AssertAssigned(t *testing.T, section string, name string,
+func (config Config) AssertAssigned(t *testing.T, section string, name string,
 	    expected string) {
-	if value := config.sections[section][name]; value != expected {
+	if value := config[section][name]; value != expected {
 		t.Errorf("expected %s.%s == %#v, got %#v", section, name, expected,
 			value)
 	}
 }
 
-func (config *Config) AssertHasSection(t *testing.T, section string,
+func (config Config) AssertHasSection(t *testing.T, section string,
         expected bool) {
     if expected != config.HasSection(section) {
         t.Errorf("expected HasSection(%#v) to be %#v", section, expected)
     }
 }
 
-func (config *Config) AssertHasValue(t *testing.T, section string, name string,
+func (config Config) AssertHasValue(t *testing.T, section string, name string,
         expected bool) {
     if expected != config.HasValue(section, name) {
         t.Errorf("expected HasValue(%#v, %#v) to be %#v", section, name,
@@ -37,7 +37,7 @@ func (config *Config) AssertHasValue(t *testing.T, section string, name string,
     }
 }
 
-func (config *Config) AssertGetValue(t *testing.T, section string, name string,
+func (config Config) AssertGetValue(t *testing.T, section string, name string,
         expected string) {
     if value, _ := config.GetValue(section, name); expected != value {
         t.Errorf("expected GetValue(%#v, %#v) to be %#v, got %#v", section,
@@ -46,26 +46,26 @@ func (config *Config) AssertGetValue(t *testing.T, section string, name string,
 }
 
 func TestHasSection(t *testing.T) {
-    config := NewConfig()
+    config := make(Config)
     config.AssertHasSection(t, "test", false)
-    config.sections["test"] = make(map[string] string)
+    config.AddSection("test")
     config.AssertHasSection(t, "test", true)
 }
 
 func TestHasValue(t *testing.T) {
-    config := NewConfig()
+    config := make(Config)
     config.AssertHasValue(t, "test", "x", false)
-    config.sections["test"] = make(map[string] string)
+    config.AddSection("test")
     config.AssertHasValue(t, "test", "x", false)
-    config.sections["test"]["x"] = "1"
+    config["test"]["x"] = "1"
     config.AssertHasValue(t, "test", "x", true)
 }
 
 func TestGetValue(t *testing.T) {
-    config := NewConfig()
+    config := make(Config)
     config.AssertGetValue(t, "test", "x", "")
-    config.sections["test"] = make(map[string] string)
-    config.sections["test"]["x"] = "1"
+    config.AddSection("test")
+    config["test"]["x"] = "1"
     config.AssertGetValue(t, "test", "x", "1")
 }
 
@@ -97,14 +97,13 @@ func (parser *ConfigParser) AssertAssigned(t *testing.T, section string,
 }
 
 func TestParseAssignment(t *testing.T) {
-    parser := ConfigParser{
-        config: NewConfig(),
-    }
-    parser.AssertParseAssignment(t, "")
-    parser.AssertParseAssignment(t, "    ")
+    config := make(Config)
+    parser := ConfigParser{config: &config}
+
     AssertSyntaxError(t, parser.ParseAssignment("x=1"))
 	parser.AssertEmpty(t)
 
+    config.AddSection("test")
     parser.section = "test"
     AssertSyntaxError(t, parser.ParseAssignment("=1"))
 	parser.AssertParseAssignment(t, "x=1")
@@ -117,9 +116,8 @@ func TestParseAssignment(t *testing.T) {
 }
 
 func TestParseLine(t *testing.T) {
-    parser := ConfigParser{
-        config: NewConfig(),
-    }
+    config := make(Config)
+    parser := ConfigParser{config: &config}
 
     parser.AssertParseLine(t, "")
     parser.AssertParseLine(t, "   ")
