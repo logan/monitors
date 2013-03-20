@@ -5,9 +5,9 @@ import (
 )
 
 func main() {
-    cfg := tally.NewConfig()
+    cfg := make(tally.Config)
     cfg.Parse("production.ini")
-    server, err := tally.ServerFromConfig(*cfg)
+    server, err := tally.ServerFromConfig(cfg)
     if err != nil {
         panic(err)
     }
