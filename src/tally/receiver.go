@@ -29,7 +29,7 @@ func (receiver *Receiver) ReadOnce() (statgram Statgram, err error) {
     if err == nil {
         receiver.messageCount += 1
         receiver.byteCount += int64(size)
-        statgram = Parse(string(buf[:size]))
+        statgram = ParseStatgram(string(buf[:size]))
     }
     return
 }

@@ -60,19 +60,19 @@ func TestParseStatgramLine(t *testing.T) {
     if err == nil { t.Error("expected error, got:", statgram) }
 }
 
-func TestParse(t *testing.T) {
+func TestParseStatgram(t *testing.T) {
     expected := Statgram{
         Sample{key: "x", value: 1.0, valueType: COUNTER, sampleRate: 1.0},
         Sample{key: "x", value: 2.0, valueType: COUNTER, sampleRate: 1.0},
         Sample{key: "y", value: 1.0, valueType: TIMER, sampleRate: 0.5},
         Sample{key: "z", value: 0.1, valueType: COUNTER, sampleRate: 1.0},
     }
-    statgram := Parse("x:1|c:2|c\ny:1|ms@0.5:error\nz:0.1|c")
+    statgram := ParseStatgram("x:1|c:2|c\ny:1|ms@0.5:error\nz:0.1|c")
     if !reflect.DeepEqual(expected, statgram) {
         t.Errorf("expected %#v, got %#v", expected, statgram)
     }
 
-    statgram = Parse("x:1|c\n^022|c\ny:1|ms@0.5:error\n^fferror\nz:0.1|c")
+    statgram = ParseStatgram("x:1|c\n^022|c\ny:1|ms@0.5:error\n^fferror\nz:0.1|c")
     if !reflect.DeepEqual(expected, statgram) {
         t.Errorf("expected %#v, got %#v", expected, statgram)
     }
